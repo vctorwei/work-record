@@ -419,69 +419,22 @@ def get_html_content(
         </style>
         """
 
-    # 注入：员工侧把 state 同步到本机的 sync_server（SQLite）
-    # 注意：管理员的“只读投射”必须关闭同步，否则会把旧快照反向覆盖数据库。
+    # 注入：员工侧把 state 同步到 Streamlit Session State
+    # 纯 Streamlit 模式：前端通过 input event 触发 Rerun
     sync_js = ""
     if enable_sync and (not readonly):
-        sync_js = f"""
-        <script>
-          const __syncUser = {json.dumps(user_display_name)};
-          function __getSyncBase() {{
-            try {{
-              if (window.parent && window.parent.location && window.parent.location.hostname) {{
-                return `http://${{window.parent.location.hostname}}:8502`;
-              }}
-            }} catch (e) {{}}
-            return 'http://localhost:8502';
-          }}
+        sync_js = "" # 之前占位，现在清空，逻辑全移到 js_inject 中
 
-          let __syncTimer = null;
-          function __postSync() {{
-            if (!__syncUser) return;
-            try {{
-              const url = __getSyncBase() + '/sync';
-              const payload = JSON.stringify({{ username: __syncUser, state }});
-
-              // 优先用 sendBeacon（更适合页面切换/iframe，且不会触发 CORS 预检）
-              if (navigator && navigator.sendBeacon) {{
-                const blob = new Blob([payload], {{ type: 'text/plain' }});
-                navigator.sendBeacon(url, blob);
-                return;
-              }}
-
-              // fallback：使用 text/plain 避免 application/json 导致的 OPTIONS 预检
-              fetch(url, {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'text/plain' }},
-                keepalive: true,
-                body: payload
-              }});
-            }} catch (e) {{}}
-          }}
-          function __scheduleSync() {{
-            if (!__syncUser) return;
-            if (__syncTimer) clearTimeout(__syncTimer);
-            __syncTimer = setTimeout(() => {{
-              __postSync();
-            }}, 300);
-          }}
-
-          // 心跳：确保状态稳定写回 DB
-          setInterval(() => {{
-            try {{
-              if (state && (state.isClockedIn || state.isMeeting || state.isResting || state.activeTaskId)) {{
-                __postSync();
-              }}
-            }} catch (e) {{}}
-          }}, 2000);
-        </script>
-        """
 
     # 把 CSS 放到 </head> 前（若没有 head，则追加）
     css_inject = f"{hide_export_css}\n{readonly_css}\n"
     html = USER_ORIGINAL_HTML
     html = _inject_before_tag(html, "</head>", css_inject)
 
+    # 移除手动复制按钮注入 (因为已经改为自动同步了)
+    # copy_state_js = ...
+    # copy_btn_html = ...
+    
     # 把覆盖逻辑插到 </body> 前（确保脚本在文档内，且执行顺序可控）
     js_inject = f"""
 {sync_js}
@@ -506,13 +459,7 @@ def get_html_content(
   } catch (e) {}
 
   function __forceSyncNow() {
-    try {
-      if (typeof document !== 'undefined' && document.getElementById('userNameInput')) {
-        state.userName = document.getElementById('userNameInput').value;
-      }
-    } catch (e) {}
-    try { __postSync(); } catch (e) {}
-    try { __scheduleSync(); } catch (e) {}
+    // 纯 Streamlit 模式：不再需要强制推送 HTTP 请求
   }
 
   const __origSaveState = (typeof saveState === 'function') ? saveState : null;
@@ -523,8 +470,9 @@ def get_html_content(
         state.userName = document.getElementById('userNameInput').value;
       }
       localStorage.setItem('perf_v46_state', JSON.stringify(state));
+      // 触发 Streamlit 同步
+      if (typeof triggerStreamlitSync === 'function') triggerStreamlitSync();
     } catch (e) {}
-    __forceSyncNow();
   }
 
   function __wrap(fnName) {
@@ -533,7 +481,8 @@ def get_html_content(
       if (typeof fn !== 'function') return;
       window[fnName] = function() {
         const ret = fn.apply(this, arguments);
-        try { __forceSyncNow(); } catch (e) {}
+        // 操作后触发同步
+        try { if (typeof triggerStreamlitSync === 'function') triggerStreamlitSync(); } catch (e) {}
         return ret;
       }
     } catch (e) {}
@@ -742,12 +691,101 @@ header { display: none !important; }
             unsafe_allow_html=True,
         )
 
-        # 主区域仅渲染 HTML（员工隐藏导出按钮）
+        # 1. 接收来自前端的自动同步数据
+        # 我们创建一个隐藏的输入框，前端 JS 会把 state JSON 写入这里并触发 Rerun
+        sync_data = st.text_input("sync_hidden_input", key="sync_input", label_visibility="collapsed")
+        
+        if sync_data:
+            try:
+                # 只有当数据真的变化且有效时才写入
+                # 为了避免死循环，我们可以对比一下最后更新时间或内容hash，这里简化处理
+                parsed = json.loads(sync_data)
+                
+                # 写入 DB
+                conn.execute(
+                    "INSERT OR REPLACE INTO user_data VALUES (?, ?, ?)",
+                    (st.session_state.username, sync_data, datetime.now()),
+                )
+                conn.commit()
+                
+                # 更新当前的 current_state，确保 Python 渲染的 HTML 也是最新的
+                current_state = sync_data
+                
+                # 清空输入框以防下一次 Rerun 重复处理 (Streamlit 机制限制，可能需要 Session State 配合)
+                # 但由于 HTML 是根据 current_state 渲染的，所以即便清空也没关系，前端会维持状态
+            except Exception:
+                pass
+
+        # 2. 渲染 HTML
+        # 我们注入一段 JS：重写 saveState 函数，使其不仅保存到 LocalStorage，
+        # 还把 state JSON 填入 Streamlit 的隐藏输入框并触发 Input 事件
+        
+        # 查找 Streamlit input 的 JS 逻辑（通过 aria-label 或结构查找）
+        # 注意：Streamlit 的 DOM 结构可能会变，这里使用一种较通用的查找方式
+        
+        auto_sync_js = """
+        <script>
+            function findStreamlitInput() {
+                // 查找 label 为 sync_hidden_input 的 input 元素
+                // Streamlit 的 input 通常在 div[data-testid="stTextInput"] input
+                const inputs = document.querySelectorAll('input[type="text"]');
+                for (let input of inputs) {
+                    // 向上找 label 或者通过其他特征。
+                    // 由于我们设置了 label_visibility="collapsed"，aria-label 应该还在
+                    if (input.getAttribute("aria-label") === "sync_hidden_input") {
+                        return input;
+                    }
+                }
+                return null;
+            }
+
+            function triggerStreamlitSync() {
+                const input = findStreamlitInput();
+                if (!input) return;
+
+                const newState = JSON.stringify(state);
+                
+                // 只有当内容不同时才触发，避免死循环
+                if (input.value === newState) return;
+
+                // 模拟 React 的输入事件
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                nativeInputValueSetter.call(input, newState);
+                
+                const event = new Event('input', { bubbles: true });
+                input.dispatchEvent(event);
+                
+                // Streamlit 通常监听 enter 键或失焦来提交，或者 input 后的自动防抖
+                // 模拟回车
+                const enterEvent = new KeyboardEvent('keydown', {
+                    bubbles: true, cancelable: true, keyCode: 13
+                });
+                input.dispatchEvent(enterEvent);
+            }
+
+            // 覆盖 saveState
+            const __oldSaveState = saveState;
+            saveState = function() {
+                __oldSaveState(); // 原有的 LocalStorage 逻辑
+                triggerStreamlitSync(); // 触发 Streamlit 同步
+            }
+            
+            // 页面加载完成后尝试一次同步（防止 Python 端是空的）
+            setTimeout(triggerStreamlitSync, 1000);
+        </script>
+        """
+        
+        final_html = get_html_content(current_state, is_admin=False, user_display_name=st.session_state.username)
+        final_html = _inject_before_tag(final_html, "</body>", auto_sync_js)
+
         components.html(
-            get_html_content(current_state, is_admin=False, user_display_name=st.session_state.username),
+            final_html,
             height=950,
             scrolling=True,
         )
+
+        # 移除之前的手动同步区
+        # with st.expander("☁️ 数据同步中心", expanded=True): ...
 
     conn.close()
 else:
