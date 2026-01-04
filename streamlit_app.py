@@ -488,6 +488,20 @@ def get_html_content(
     } catch (e) {}
   }
   ['toggleClock','toggleMeeting','toggleRest','toggleTask','completeTask','reopen','confirmAddTask','addSolu'].forEach(__wrap);
+  
+  // 额外监控：当特定DOM元素发生变化时也触发（针对非函数调用的场景，如拖拽）
+  try {
+    const observer = new MutationObserver((mutations) => {
+       // 简单防抖，避免频繁触发
+       if (window.__syncTimeout) clearTimeout(window.__syncTimeout);
+       window.__syncTimeout = setTimeout(() => {
+          if (typeof triggerStreamlitSync === 'function') triggerStreamlitSync();
+       }, 800);
+    });
+    // 监控任务列表变化（拖拽、新增）
+    const taskBody = document.getElementById('taskBody');
+    if (taskBody) observer.observe(taskBody, { childList: true, subtree: true, characterData: true });
+  } catch(e) {}
 
   } catch (e) {}
 
@@ -693,7 +707,12 @@ header { display: none !important; }
 
         # 1. 接收来自前端的自动同步数据
         # 我们创建一个隐藏的输入框，前端 JS 会把 state JSON 写入这里并触发 Rerun
-        sync_data = st.text_input("sync_hidden_input", key="sync_input", label_visibility="collapsed")
+        # key 必须固定，否则重绘会丢失焦点
+        sync_data = st.text_input("sync_hidden_input", key="sync_input", label_visibility="visible") 
+        # label_visibility="visible" 为了调试，看能不能看到输入框，如果不希望看到，后续改回 collapsed
+        # 同时利用 CSS 把它藏起来，但保持 DOM 结构完整
+        st.markdown("""<style>div[data-testid="stTextInput"] input[aria-label="sync_hidden_input"] { opacity: 0.01; height: 1px; }</style>""", unsafe_allow_html=True)
+
         
         if sync_data:
             try:
@@ -726,12 +745,10 @@ header { display: none !important; }
         auto_sync_js = """
         <script>
             function findStreamlitInput() {
-                // 查找 label 为 sync_hidden_input 的 input 元素
-                // Streamlit 的 input 通常在 div[data-testid="stTextInput"] input
-                const inputs = document.querySelectorAll('input[type="text"]');
+                // 更健壮的查找：查找 key="sync_input" 生成的 widget
+                // Streamlit 生成的 input 通常有 aria-label
+                const inputs = document.querySelectorAll('input');
                 for (let input of inputs) {
-                    // 向上找 label 或者通过其他特征。
-                    // 由于我们设置了 label_visibility="collapsed"，aria-label 应该还在
                     if (input.getAttribute("aria-label") === "sync_hidden_input") {
                         return input;
                     }
@@ -741,13 +758,14 @@ header { display: none !important; }
 
             function triggerStreamlitSync() {
                 const input = findStreamlitInput();
-                if (!input) return;
+                if (!input) {
+                    console.log("Sync failed: input not found");
+                    return;
+                }
 
                 const newState = JSON.stringify(state);
                 
-                // 只有当内容不同时才触发，避免死循环
-                if (input.value === newState) return;
-
+                // 强制触发更新，哪怕内容一样（为了心跳）
                 // 模拟 React 的输入事件
                 const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
                 nativeInputValueSetter.call(input, newState);
@@ -755,12 +773,17 @@ header { display: none !important; }
                 const event = new Event('input', { bubbles: true });
                 input.dispatchEvent(event);
                 
-                // Streamlit 通常监听 enter 键或失焦来提交，或者 input 后的自动防抖
-                // 模拟回车
+                // Streamlit 2024+ 版本的 Text Input 需要更激进的触发方式
+                // 尝试模拟 Enter 键
                 const enterEvent = new KeyboardEvent('keydown', {
-                    bubbles: true, cancelable: true, keyCode: 13
+                    bubbles: true, cancelable: true, keyCode: 13, key: 'Enter', code: 'Enter'
                 });
                 input.dispatchEvent(enterEvent);
+                
+                // 再次尝试 blur，有些版本依赖失焦提交
+                input.dispatchEvent(new Event('blur', { bubbles: true }));
+                
+                console.log("Sync triggered to Python");
             }
 
             // 覆盖 saveState
@@ -770,8 +793,13 @@ header { display: none !important; }
                 triggerStreamlitSync(); // 触发 Streamlit 同步
             }
             
-            // 页面加载完成后尝试一次同步（防止 Python 端是空的）
-            setTimeout(triggerStreamlitSync, 1000);
+            // 轮询：每10秒强制同步一次
+            setInterval(() => {
+                triggerStreamlitSync();
+            }, 10000);
+            
+            // 页面加载完成后尝试一次同步
+            setTimeout(triggerStreamlitSync, 2000);
         </script>
         """
         
