@@ -584,6 +584,22 @@ with st.sidebar:
             l_user = st.text_input("账号", key="l_user")
             l_pwd = st.text_input("密码", type="password", key="l_pwd")
             if st.button("进入系统"):
+                # 1. 优先检查 secrets 中的 fmadmin (Streamlit Cloud 部署专用)
+                is_secret_admin = False
+                try:
+                    # 只有当 secrets 中配置了 AdminPW 且账号为 fmadmin 时生效
+                    if l_user == "fmadmin" and "AdminPW" in st.secrets and l_pwd == st.secrets["AdminPW"]:
+                        is_secret_admin = True
+                except Exception:
+                    pass
+
+                if is_secret_admin:
+                    st.session_state.logged_in = True
+                    st.session_state.username = "fmadmin"
+                    st.session_state.role = "admin"
+                    st.rerun()
+
+                # 2. 检查数据库用户
                 conn = get_db_connection()
                 res = conn.execute("SELECT role FROM users WHERE username=? AND password=?", (l_user, l_pwd)).fetchone()
                 conn.close()
